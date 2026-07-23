@@ -33,10 +33,16 @@ class LogsinkClient(
     private val ingestUrl: String,
     /** Per-app append key. Inject via BuildConfig — never hardcode in source. */
     private val apiKey: String,
-    /** Level used until /ingest/config has answered. */
+    /** Optional device label (e.g. Build.MODEL) — lets one app's phone/car/tablet
+     *  lines be told apart in the sink. */
+    private val device: String? = null,
+    /** Level used once /ingest/config has answered; see [configKnown] for before. */
     defaultLevel: String = "WARN",
     private val flushIntervalMs: Long = 15_000L,
     private val configRefreshMs: Long = 5 * 60_000L,
+    /** Retry cadence until the FIRST config answer — a car may be offline for the
+     *  first minutes of a drive, and 5 min would miss the interesting window. */
+    private val configInitialRetryMs: Long = 30_000L,
     private val maxBufferedLines: Int = 2_000,
     private val maxBatchLines: Int = 200,
     private val maxBackoffMs: Long = 5 * 60_000L,
@@ -53,6 +59,13 @@ class LogsinkClient(
     @Volatile
     private var minLevel: Int = LEVELS[defaultLevel.uppercase()] ?: 30
 
+    /** False until /ingest/config has answered once. Until then EVERYTHING is
+     *  enqueued (bounded buffer; the shim still drops below-level server-side) —
+     *  otherwise an offline app start silently discards the lines an
+     *  investigation turned DEBUG on to capture. */
+    @Volatile
+    private var configKnown = false
+
     @Volatile
     private var backoffUntilMs: Long = 0L
     private var backoffMs: Long = 0L
@@ -67,18 +80,19 @@ class LogsinkClient(
     private val configJob: Job = scope.launch {
         while (true) {
             runCatching { refreshConfig() }
-            delay(configRefreshMs)
+            delay(if (configKnown) configRefreshMs else configInitialRetryMs)
         }
     }
 
     /** Called by [LogsinkTree]; safe from any thread, never blocks on I/O. */
     fun enqueue(level: String, tag: String?, msg: String) {
         val levelValue = LEVELS[level] ?: 20
-        if (levelValue < minLevel) return
+        if (configKnown && levelValue < minLevel) return
         val line = JSONObject().apply {
             put("ts", System.currentTimeMillis())
             put("level", level)
             if (tag != null) put("tag", tag)
+            if (device != null) put("device", device)
             put("msg", msg)
         }.toString()
         synchronized(lock) {
@@ -170,6 +184,7 @@ class LogsinkClient(
                 val body = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
                 val level = JSONObject(body).optString("level", "").uppercase()
                 LEVELS[level]?.let { minLevel = it }
+                configKnown = true
             }
             conn.disconnect()
         } catch (_: IOException) {
