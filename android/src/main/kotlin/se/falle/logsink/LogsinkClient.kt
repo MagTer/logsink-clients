@@ -13,17 +13,27 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.ArrayDeque
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Ships log lines to a logsink-shim instance per the ADR-011 client contract:
  *
- *  - bounded buffer, drop-oldest — never unbounded on-device
+ *  - bounded buffer, drop-oldest — never unbounded on-device; overflow is
+ *    accounted for with a synthetic "dropped N lines" WARN marker so a gap in
+ *    the sink is distinguishable from an app that logged nothing
+ *  - every line carries a random per-process session id ("sid") and a
+ *    monotonically increasing sequence number ("seq") — process restarts and
+ *    shipping gaps are visible as sid changes / seq holes
  *  - batch NDJSON POST /ingest on an interval, off the main thread
  *  - level fetched from GET /ingest/config and cached; lines below it are
  *    dropped client-side (the shim drops again server-side)
  *  - 429 honors Retry-After; 5xx/network errors back off exponentially
  *    (capped); 401 drops the batch — a wrong key cannot be retried into
  *    working
+ *  - [flushNow] flushes past any accumulated backoff — hook it to a
+ *    validated-connectivity signal so a backoff grown while offline cannot
+ *    sleep through a short online window
  *
  * This class must never log through Timber itself (a LogsinkTree would loop);
  * its own diagnostics go to logcat only, and sparsely.
@@ -55,6 +65,14 @@ class LogsinkClient(
 
     private val buffer = ArrayDeque<String>()
     private val lock = Any()
+
+    /** Random per-process id + per-line sequence: sid changes mark restarts, seq holes mark
+     *  lost lines — the difference between "app went silent" and "lines were dropped". */
+    private val sessionId = UUID.randomUUID().toString().take(8)
+    private val seq = AtomicLong(0L)
+
+    /** Lines discarded by drop-oldest since the last overflow marker. Guarded by [lock]. */
+    private var droppedSinceMarker = 0L
 
     @Volatile
     private var minLevel: Int = LEVELS[defaultLevel.uppercase()] ?: 30
@@ -88,18 +106,26 @@ class LogsinkClient(
     fun enqueue(level: String, tag: String?, msg: String) {
         val levelValue = LEVELS[level] ?: 20
         if (configKnown && levelValue < minLevel) return
-        val line = JSONObject().apply {
+        val line = jsonLine(level, tag, msg)
+        synchronized(lock) {
+            if (buffer.size >= maxBufferedLines) { // drop-oldest
+                buffer.pollFirst()
+                droppedSinceMarker++
+            }
+            buffer.addLast(line)
+        }
+    }
+
+    private fun jsonLine(level: String, tag: String?, msg: String): String =
+        JSONObject().apply {
             put("ts", System.currentTimeMillis())
             put("level", level)
             if (tag != null) put("tag", tag)
             if (device != null) put("device", device)
+            put("sid", sessionId)
+            put("seq", seq.incrementAndGet())
             put("msg", msg)
         }.toString()
-        synchronized(lock) {
-            if (buffer.size >= maxBufferedLines) buffer.pollFirst() // drop-oldest
-            buffer.addLast(line)
-        }
-    }
 
     /**
      * Flush outside the interval — call from a lifecycle hook when the app
@@ -107,10 +133,29 @@ class LogsinkClient(
      */
     suspend fun flush() = withContext(Dispatchers.IO) { runCatching { flushInternal() } }
 
+    /**
+     * Flush immediately, ignoring any accumulated backoff — call when connectivity is known
+     * to have just returned (e.g. NET_CAPABILITY_VALIDATED). A backoff grown during an
+     * offline stretch would otherwise sleep through a short online window.
+     */
+    suspend fun flushNow() = withContext(Dispatchers.IO) {
+        backoffMs = 0L
+        backoffUntilMs = 0L
+        runCatching { flushInternal() }
+    }
+
     private fun flushInternal() {
         if (System.currentTimeMillis() < backoffUntilMs) return
         while (true) {
             val batch = synchronized(lock) {
+                // Account for overflow before the batch, so the marker ships ahead of the
+                // lines that survived it.
+                if (droppedSinceMarker > 0) {
+                    buffer.addFirst(
+                        jsonLine("WARN", TAG, "buffer overflow: dropped $droppedSinceMarker lines on device")
+                    )
+                    droppedSinceMarker = 0
+                }
                 val n = minOf(maxBatchLines, buffer.size)
                 if (n == 0) return
                 List(n) { buffer.pollFirst()!! }
@@ -124,7 +169,10 @@ class LogsinkClient(
                     // Put the batch back at the FRONT so ordering survives.
                     synchronized(lock) {
                         batch.asReversed().forEach { buffer.addFirst(it) }
-                        while (buffer.size > maxBufferedLines) buffer.pollFirst()
+                        while (buffer.size > maxBufferedLines) {
+                            buffer.pollFirst()
+                            droppedSinceMarker++
+                        }
                     }
                     backoffMs = if (result.retryAfterMs > 0) result.retryAfterMs
                     else minOf(if (backoffMs == 0L) flushIntervalMs else backoffMs * 2, maxBackoffMs)

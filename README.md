@@ -33,8 +33,11 @@ out field logs that cannot be re-captured (shared class disk cap, ADR-011).
 - `POST /ingest` with `Authorization: Bearer <per-app key>` — body is NDJSON,
   one JSON object per line: `{"ts": <epoch-ms or RFC3339>, "level":
   "DEBUG|INFO|WARN|ERROR", "tag": "...", "msg": "..."}`. Only `msg` is
-  required. The app identity is stamped server-side from the key — clients
-  never send (and cannot spoof) an app name.
+  required; extra fields (the android client sends `device`, `sid` — a random
+  per-process session id — and `seq`, a per-line sequence number for gap
+  detection) pass through to the store. The app identity is stamped
+  server-side from the key — clients never send (and cannot spoof) an app
+  name.
 - `GET /ingest/config` (same auth) → `{"app": ..., "level": ...}` — the level
   the server wants. Drop everything below it client-side; the shim drops
   again server-side as defense in depth.
