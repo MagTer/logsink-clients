@@ -9,6 +9,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -34,9 +35,30 @@ import java.util.concurrent.atomic.AtomicLong
  *  - [flushNow] flushes past any accumulated backoff — hook it to a
  *    validated-connectivity signal so a backoff grown while offline cannot
  *    sleep through a short online window
+ *  - optional durable spool ([spoolFile]) so the buffer survives a process
+ *    death that happens while offline — see "Spool" below
  *
  * This class must never log through Timber itself (a LogsinkTree would loop);
  * its own diagnostics go to logcat only, and sparsely.
+ *
+ * ## Spool
+ *
+ * Off unless [spoolFile] is set. It is a last resort, **not** a mirror: the
+ * logging path never touches disk, and a fully online session writes nothing at
+ * all. Disk is touched only when a flush has actually failed (rate-limited by
+ * [spoolMinWriteIntervalMs]) and when the host calls [persistNow] on the way
+ * down. The file is a whole-file rewrite capped at [spoolMaxBytes], so it cannot
+ * grow, and it is deleted as soon as the buffer ships — steady state is no file.
+ *
+ * This shape is deliberate. An earlier spool in a consumer app appended every
+ * line synchronously on the logging thread and replayed an ever-growing backlog
+ * on the main thread at startup; the app ANR'd during boot, was killed, and the
+ * next boot had more to replay — logging died completely and got worse each
+ * restart. Hence: no per-line I/O, a hard size cap, replay off the main thread
+ * with the file deleted *before* it is consumed, a replay cap so old lines
+ * cannot evict the live session, and any I/O failure disabling the spool for the
+ * process rather than being retried. **The spool must never be able to take
+ * logging down with it.**
  */
 class LogsinkClient(
     /** Full ingest URL, e.g. "https://applogs.example.com/ingest". */
@@ -56,6 +78,17 @@ class LogsinkClient(
     private val maxBufferedLines: Int = 2_000,
     private val maxBatchLines: Int = 200,
     private val maxBackoffMs: Long = 5 * 60_000L,
+    /** Durable spool for lines that could not ship before the process died. Null = off.
+     *  Pass a file in the app's private storage, e.g. File(filesDir, "logsink-spool.ndjson"). */
+    private val spoolFile: File? = null,
+    /** Hard cap on the spool file. Newest lines win; the file is rewritten, never appended. */
+    private val spoolMaxBytes: Int = 64 * 1024,
+    /** Floor between spool writes while offline. The only knob that bounds write frequency —
+     *  raise it on flash-sensitive hardware (car head units), never lower it below a few
+     *  tens of seconds. */
+    private val spoolMinWriteIntervalMs: Long = 120_000L,
+    /** Cap on lines restored by [replaySpool], so a backlog cannot evict the live session. */
+    private val spoolMaxReplayLines: Int = 500,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
     private companion object {
@@ -88,6 +121,16 @@ class LogsinkClient(
     private var backoffUntilMs: Long = 0L
     private var backoffMs: Long = 0L
     private var loggedAuthFailure = false
+
+    /** Set on the first spool I/O failure and never cleared: a broken or full filesystem must
+     *  degrade to "no spool", not to a write attempt on every flush. */
+    @Volatile
+    private var spoolDisabled = false
+    private var lastSpoolWriteMs = 0L
+
+    /** [seq] at the last spool write. Nothing logged since means nothing new to persist, so
+     *  an idle offline stretch costs zero writes however long it lasts. */
+    private var lastSpooledSeq = 0L
 
     private val flushJob: Job = scope.launch {
         while (true) {
@@ -164,6 +207,9 @@ class LogsinkClient(
                 is SendResult.Ok -> {
                     backoffMs = 0L
                     loggedAuthFailure = false
+                    // Everything that was at risk has now shipped: drop the spool so the
+                    // steady state is no file on disk and the next boot replays nothing.
+                    if (synchronized(lock) { buffer.isEmpty() }) clearSpool()
                 }
                 is SendResult.RetryLater -> {
                     // Put the batch back at the FRONT so ordering survives.
@@ -177,6 +223,9 @@ class LogsinkClient(
                     backoffMs = if (result.retryAfterMs > 0) result.retryAfterMs
                     else minOf(if (backoffMs == 0L) flushIntervalMs else backoffMs * 2, maxBackoffMs)
                     backoffUntilMs = System.currentTimeMillis() + backoffMs
+                    // The lines are now provably at risk — this is the only automatic path to
+                    // disk, and it is rate-limited. Already on Dispatchers.IO here.
+                    maybeSpool(force = false)
                     return
                 }
                 is SendResult.Drop -> {
@@ -187,6 +236,106 @@ class LogsinkClient(
                 }
             }
         }
+    }
+
+    /**
+     * Persist the unshipped buffer now, ignoring the write interval — call from the host's
+     * teardown hooks (service onDestroy, ON_STOP, the uncaught-exception handler). A no-op
+     * when the spool is off, already disabled, or nothing new has been logged since the last
+     * write, so calling it liberally is cheap.
+     */
+    suspend fun persistNow() = withContext(Dispatchers.IO) { maybeSpool(force = true) }
+
+    /**
+     * Restore a previous process's unshipped lines, once, at startup. Call off the main thread
+     * — it does file I/O. The file is deleted *before* its contents are used, so a crash mid
+     * replay cannot leave a backlog that grows across boots (the failure mode that killed the
+     * previous attempt). Returns the number of lines restored.
+     */
+    suspend fun replaySpool(): Int = withContext(Dispatchers.IO) {
+        val file = spoolFile ?: return@withContext 0
+        if (spoolDisabled) return@withContext 0
+        val lines = runCatching {
+            if (!file.isFile || file.length() == 0L) return@withContext 0
+            val text = file.readText()
+            // Delete first: from here on the data lives only in memory, so no outcome of the
+            // replay can produce a file that survives to the next boot.
+            file.delete()
+            text.lineSequence().filter { it.isNotBlank() }.toList()
+        }.getOrElse {
+            disableSpool("replay failed", it)
+            return@withContext 0
+        }
+        if (lines.isEmpty()) return@withContext 0
+
+        // Keep the NEWEST, and cap them: a long offline stretch must not push the session
+        // that is about to happen out of a bounded buffer.
+        val restored = lines.takeLast(spoolMaxReplayLines)
+        synchronized(lock) {
+            restored.asReversed().forEach { buffer.addFirst(it) }
+            while (buffer.size > maxBufferedLines) {
+                buffer.pollFirst()
+                droppedSinceMarker++
+            }
+        }
+        // Marker so a replay is visible in the sink rather than looking like duplicate lines.
+        enqueue("INFO", TAG, "spool: replayed ${restored.size} unshipped lines from a previous process")
+        restored.size
+    }
+
+    /**
+     * Write the buffer to [spoolFile]. Whole-file rewrite through a temp file + rename, so a
+     * kill mid-write leaves either the old file or the new one, never a torn one.
+     */
+    private fun maybeSpool(force: Boolean) {
+        val file = spoolFile ?: return
+        if (spoolDisabled) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastSpoolWriteMs < spoolMinWriteIntervalMs) return
+        // Nothing logged since the last write — the file on disk is still accurate.
+        if (seq.get() == lastSpooledSeq) return
+
+        val snapshot = synchronized(lock) { buffer.toList() }
+        if (snapshot.isEmpty()) {
+            clearSpool()
+            return
+        }
+        // Newest-first accumulation so the cap keeps the most recent lines, then restore order.
+        val kept = ArrayDeque<String>()
+        var bytes = 0
+        for (line in snapshot.asReversed()) {
+            val cost = line.length + 1
+            if (bytes + cost > spoolMaxBytes) break
+            kept.addFirst(line)
+            bytes += cost
+        }
+        if (kept.isEmpty()) return
+
+        runCatching {
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(kept.joinToString("\n"))
+            if (!tmp.renameTo(file)) {
+                tmp.delete()
+                throw IOException("spool rename failed")
+            }
+        }.onFailure {
+            disableSpool("write failed", it)
+            return
+        }
+        lastSpoolWriteMs = now
+        lastSpooledSeq = seq.get()
+    }
+
+    private fun clearSpool() {
+        val file = spoolFile ?: return
+        if (spoolDisabled) return
+        runCatching { if (file.exists()) file.delete() }
+        lastSpooledSeq = seq.get()
+    }
+
+    private fun disableSpool(what: String, cause: Throwable) {
+        spoolDisabled = true
+        Log.w(TAG, "spool $what — disabled for this process, logging continues", cause)
     }
 
     private sealed class SendResult {

@@ -62,6 +62,46 @@ Then `-PlogsinkKey=...` in CI or `logsinkKey=...` in the untracked
 - The client never logs through Timber (that would recurse via this tree);
   its own diagnostics go to logcat, sparsely.
 
+## Durable spool (opt-in)
+
+The in-memory buffer survives an offline stretch, but not the process dying
+during one — the tail of a drive that ends out of coverage is lost. Pass a
+`spoolFile` to persist it:
+
+```kotlin
+val client = LogsinkClient(
+    ingestUrl = "...",
+    apiKey = BuildConfig.LOGSINK_KEY,
+    spoolFile = File(filesDir, "logsink-spool.ndjson"),
+    spoolMinWriteIntervalMs = 120_000L,   // raise on flash-sensitive hardware
+)
+// Startup, off the main thread — restores a previous process's unshipped lines.
+scope.launch { client.replaySpool() }
+// Teardown hooks (ON_STOP, Service.onDestroy, uncaught-exception handler).
+scope.launch { client.persistNow() }
+```
+
+It is a last resort, not a mirror:
+
+- **The logging path never touches disk.** A fully online session writes
+  nothing at all — the file is only created once a flush has actually failed.
+- Automatic writes are rate-limited by `spoolMinWriteIntervalMs` (default
+  2 min) and skipped entirely when nothing has been logged since the last one,
+  so an idle offline stretch costs zero writes however long it lasts.
+- The file is a whole-file rewrite capped at `spoolMaxBytes` (default 64 KB),
+  newest lines kept — it cannot grow, and it is written via temp + rename so a
+  kill mid-write cannot tear it.
+- It is deleted as soon as the buffer ships. Steady state is no file.
+- `replaySpool()` deletes the file *before* consuming it and caps what it
+  restores (`spoolMaxReplayLines`), so a backlog can neither survive a crashing
+  replay nor evict the session that is about to happen.
+- Any I/O failure disables the spool for the process and logs one line to
+  logcat. **It must never be able to take logging down with it** — an earlier
+  consumer-side spool appended every line synchronously on the logging thread
+  and replayed a growing backlog on the main thread at boot; the app ANR'd, was
+  killed, and each restart had more to replay. Logging died completely. The
+  constraints above exist to make that shape impossible.
+
 ## Status
 
 Scaffold, not yet exercised by a real consumer — Retro FM is the first.
