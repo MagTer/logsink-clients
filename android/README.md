@@ -59,6 +59,15 @@ Then `-PlogsinkKey=...` in CI or `logsinkKey=...` in the untracked
 - `429` pauses sending for `Retry-After`; network errors and `5xx` back off
   exponentially, capped at 5 min. `401` drops the batch and logs one warning
   to logcat — a wrong key never causes a retry storm.
+- `413` halves the batch and retries, restoring the full size on the next
+  success; a single line that still will not fit is dropped. A batch is bounded
+  by bytes (128 KB) as well as lines, and one message is truncated at 8 KB.
+  This exists because a body limit is usually enforced by a proxy the client
+  was never told about: a reverse proxy in front of one sink capped bodies at
+  4 KB, and before this the client retried the same oversized batch forever —
+  every line behind it stuck for the life of the process, which looks exactly
+  like an app that stopped logging (root-caused 2026-08-09). **Any permanent
+  rejection has to make the queue smaller, never leave it unchanged.**
 - The client never logs through Timber (that would recurse via this tree);
   its own diagnostics go to logcat, sparsely.
 

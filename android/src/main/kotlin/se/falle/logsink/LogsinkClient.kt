@@ -77,6 +77,14 @@ class LogsinkClient(
     private val configInitialRetryMs: Long = 30_000L,
     private val maxBufferedLines: Int = 2_000,
     private val maxBatchLines: Int = 200,
+    /** Byte budget for one POST body. A line cap alone says nothing about size — 200 lines
+     *  carrying long messages is a very different request from 200 short ones, and the entity
+     *  that rejects an oversized body is usually a proxy the client never hears about in
+     *  advance. Keep this below the smallest body limit on the path. */
+    private val maxBatchBytes: Int = 128 * 1024,
+    /** Longest single message kept intact; the rest is truncated with a marker. A line larger
+     *  than the path's body limit could never ship in any batch, so it must not exist. */
+    private val maxLineBytes: Int = 8 * 1024,
     private val maxBackoffMs: Long = 5 * 60_000L,
     /** Durable spool for lines that could not ship before the process died. Null = off.
      *  Pass a file in the app's private storage, e.g. File(filesDir, "logsink-spool.ndjson"). */
@@ -121,6 +129,10 @@ class LogsinkClient(
     private var backoffUntilMs: Long = 0L
     private var backoffMs: Long = 0L
     private var loggedAuthFailure = false
+
+    /** Lines per POST, halved whenever the path answers 413 and restored on the next success.
+     *  Lets the client discover a body limit it was never told about. */
+    private var batchLineCap: Int = maxBatchLines
 
     /** Set on the first spool I/O failure and never cleared: a broken or full filesystem must
      *  degrade to "no spool", not to a write attempt on every flush. */
@@ -167,7 +179,7 @@ class LogsinkClient(
             if (device != null) put("device", device)
             put("sid", sessionId)
             put("seq", seq.incrementAndGet())
-            put("msg", msg)
+            put("msg", if (msg.length <= maxLineBytes) msg else msg.take(maxLineBytes) + "…[truncated]")
         }.toString()
 
     /**
@@ -199,13 +211,26 @@ class LogsinkClient(
                     )
                     droppedSinceMarker = 0
                 }
-                val n = minOf(maxBatchLines, buffer.size)
-                if (n == 0) return
-                List(n) { buffer.pollFirst()!! }
+                if (buffer.isEmpty()) return
+                // Bounded by lines AND bytes; batchLineCap shrinks when something on the path
+                // rejects the size, so the queue can find a size that fits instead of
+                // retrying an impossible request forever.
+                val take = ArrayList<String>()
+                var bytes = 0
+                while (take.size < minOf(batchLineCap, buffer.size)) {
+                    val next = buffer.peekFirst() ?: break
+                    val cost = next.length + 1
+                    if (take.isNotEmpty() && bytes + cost > maxBatchBytes) break
+                    buffer.pollFirst()
+                    take.add(next)
+                    bytes += cost
+                }
+                take
             }
             when (val result = post(batch.joinToString("\n"))) {
                 is SendResult.Ok -> {
                     backoffMs = 0L
+                    batchLineCap = maxBatchLines
                     loggedAuthFailure = false
                     // Everything that was at risk has now shipped: drop the spool so the
                     // steady state is no file on disk and the next boot replays nothing.
@@ -232,6 +257,23 @@ class LogsinkClient(
                     if (!loggedAuthFailure) {
                         Log.w(TAG, "ingest rejected the app key (401) — dropping batch, check the configured key")
                         loggedAuthFailure = true
+                    }
+                }
+                is SendResult.TooLarge -> {
+                    // Something on the path refused the body size. Retrying it unchanged is
+                    // the one failure that never ends: the batch cannot shrink on its own, so
+                    // it blocks every line behind it for as long as the process lives. Halve
+                    // and retry; a single line that still will not fit is dropped, because one
+                    // unshippable line must not cost the whole session.
+                    if (batch.size > 1) {
+                        batchLineCap = maxOf(1, batch.size / 2)
+                        synchronized(lock) {
+                            batch.asReversed().forEach { buffer.addFirst(it) }
+                        }
+                        Log.w(TAG, "ingest refused a ${batch.size}-line batch as too large — retrying at $batchLineCap")
+                    } else {
+                        Log.w(TAG, "ingest refused a single ${batch[0].length}-byte line — dropping it")
+                        synchronized(lock) { droppedSinceMarker++ }
                     }
                 }
             }
@@ -341,6 +383,10 @@ class LogsinkClient(
     private sealed class SendResult {
         object Ok : SendResult()
         object Drop : SendResult()
+
+        /** 413 — the body was refused for its size, by the shim or by anything in front of it.
+         *  Distinct from [RetryLater] because the same bytes will be refused every time. */
+        object TooLarge : SendResult()
         data class RetryLater(val retryAfterMs: Long) : SendResult()
     }
 
@@ -362,6 +408,7 @@ class LogsinkClient(
                 code in 200..299 -> SendResult.Ok
                 code == 401 -> SendResult.Drop
                 code == 429 -> SendResult.RetryLater(retryAfterMs)
+                code == 413 -> SendResult.TooLarge
                 else -> SendResult.RetryLater(0L)
             }
         } catch (_: IOException) {
