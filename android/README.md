@@ -4,7 +4,8 @@ Kotlin library implementing the ADR-011 client contract as a
 [Timber](https://github.com/JakeWharton/timber) tree. Call sites keep using
 plain `Timber.d/w/e` — this tree buffers, batches and ships according to the
 contract (bounded drop-oldest buffer, interval flush, server-configured
-level, 429/5xx backoff, 401 drop).
+level, 429/5xx backoff, 401 drop; a 3xx is never followed and is dropped like a 401,
+since that is how Cloudflare Access refuses a request).
 
 ## Usage
 
@@ -13,6 +14,10 @@ level, 429/5xx backoff, 401 drop).
 val client = LogsinkClient(
     ingestUrl = "https://applogs.<your-domain>/ingest",
     apiKey = BuildConfig.LOGSINK_KEY,   // injected at build time, see below
+    // Only behind Cloudflare Access (home-server's cluster): its service token, both or
+    // neither. Blank = not sent, so a build without them works against a sink without Access.
+    accessClientId = BuildConfig.LOGSINK_CF_ID,
+    accessClientSecret = BuildConfig.LOGSINK_CF_SECRET,
 )
 Timber.plant(LogsinkTree(client))
 ```

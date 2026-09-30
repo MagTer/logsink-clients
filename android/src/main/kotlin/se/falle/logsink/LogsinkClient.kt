@@ -65,6 +65,12 @@ class LogsinkClient(
     private val ingestUrl: String,
     /** Per-app append key. Inject via BuildConfig — never hardcode in source. */
     private val apiKey: String,
+    /** Cloudflare Access service token in front of the sink (home-server
+     *  APPLOGS-MIGRATION-DESIGN A4). Sent as CF-Access-Client-Id/-Secret only when BOTH are
+     *  non-blank, so an installation without them behaves exactly as before. Like the key it
+     *  ships in the APK and is extractable; it only gets a request past Access. */
+    private val accessClientId: String? = null,
+    private val accessClientSecret: String? = null,
     /** Optional device label (e.g. Build.MODEL) — lets one app's phone/car/tablet
      *  lines be told apart in the sink. */
     private val device: String? = null,
@@ -102,6 +108,21 @@ class LogsinkClient(
     private companion object {
         const val TAG = "LogsinkClient"
         val LEVELS = mapOf("DEBUG" to 10, "INFO" to 20, "WARN" to 30, "ERROR" to 40)
+    }
+
+    private val accessHeaders: Boolean =
+        !accessClientId.isNullOrBlank() && !accessClientSecret.isNullOrBlank()
+
+    /** Every request carries the same credentials, set in one place. Redirects are NOT
+     *  followed: Access answers a refused request with a 302 to its login page, and a
+     *  followed redirect would read that page's 200 as "shipped" and drop the lines. */
+    private fun HttpURLConnection.authorize() {
+        instanceFollowRedirects = false
+        setRequestProperty("Authorization", "Bearer $apiKey")
+        if (accessHeaders) {
+            setRequestProperty("CF-Access-Client-Id", accessClientId)
+            setRequestProperty("CF-Access-Client-Secret", accessClientSecret)
+        }
     }
 
     private val buffer = ArrayDeque<String>()
@@ -397,7 +418,7 @@ class LogsinkClient(
                 connectTimeout = 10_000
                 readTimeout = 10_000
                 doOutput = true
-                setRequestProperty("Authorization", "Bearer $apiKey")
+                authorize()
                 setRequestProperty("Content-Type", "application/x-ndjson")
             }
             conn.outputStream.use { it.write(ndjson.toByteArray(Charsets.UTF_8)) }
@@ -407,6 +428,9 @@ class LogsinkClient(
             when {
                 code in 200..299 -> SendResult.Ok
                 code == 401 -> SendResult.Drop
+                // Access refused the request (no or a wrong service token): the same bytes
+                // are refused every time, so this is a 401, not a retry.
+                code in 300..399 -> SendResult.Drop
                 code == 429 -> SendResult.RetryLater(retryAfterMs)
                 code == 413 -> SendResult.TooLarge
                 else -> SendResult.RetryLater(0L)
@@ -422,7 +446,7 @@ class LogsinkClient(
                 requestMethod = "GET"
                 connectTimeout = 10_000
                 readTimeout = 10_000
-                setRequestProperty("Authorization", "Bearer $apiKey")
+                authorize()
             }
             if (conn.responseCode in 200..299) {
                 val body = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
