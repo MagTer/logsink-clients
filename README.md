@@ -1,5 +1,11 @@
 # logsink-clients
 
+> **ARCHIVED 2026-10-04: this repo has no consumer.** Retro FM, its only one, reports
+> through OpenTelemetry to `telemetry-edge` since 1.0.67, and the `applogs` sink these
+> clients posted to was removed from both clusters the same day. The successor design
+> is `home-server`'s `docs/planning/TELEMETRY-DESIGN.md` and ADR-013 (which supersedes
+> ADR-011). This README's own rule: a directory exists only while a real consumer does.
+
 Client libraries for the `applogs` log sink — field-debug logging from apps
 that cannot be reached any other way (a car head unit, a friend's phone, a
 user's browser).
